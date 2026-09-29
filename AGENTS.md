@@ -13,8 +13,19 @@ This is Business Model 02 of a 30-project learning series. The user is learning 
 - Use sample/anonymous data only. Never commit secrets or real customer data.
 - Run tests and builds before commit when dependencies are available.
 
+## Session start and scope
+- Work only inside the currently selected repository (`02-reservation-noshow-dashboard`). Do not browse, read, or modify other numbered projects (01, 03, ...) or parent folders.
+- At the start of every new session, read `PROJECT_STATE.md` and `BUSINESS_MODEL.md` first. They hold the current state, known risks, and the single next task. Update `PROJECT_STATE.md` when a task is finished.
+
+## Workflow
+- One P0 at a time. Do not start the next P0 or mix unrelated changes into one commit.
+- Reproduce before fixing: show the problem (a failing regression test) first, then make the smallest change.
+- Add regression tests for every fix and keep all existing tests passing.
+- Do not commit or push until the user has approved the verified diff (diff, tests, builds, secrets check).
+- GitHub `main` is the source of truth. Vercel is the real deployment target (production URL in `PROJECT_STATE.md`). Do not add a GitHub Pages workflow.
+
 ## Verification
 Prefer:
 `npm run typecheck && npm run typecheck:domain && npm test && npm run build && npm run build:vite`
 
-If package-lock.json is added later, prefer `npm ci` over `npm install` in CI.
+`package-lock.json` is committed: prefer `npm ci` over `npm install` for clean installs and in CI (`.github/workflows/ci.yml` does).
