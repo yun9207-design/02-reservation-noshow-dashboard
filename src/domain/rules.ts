@@ -23,13 +23,14 @@ export function bookingCheck(state:AppState,draft:ReservationDraft,ignoreId?:str
 }
 export function cancellationDecision(state:AppState,r:Reservation,at=state.simulatedNow):CancellationDecision{
   if(['cancelled','completed','no_show'].includes(r.status))return {allowed:false,late:false,depositOutcome:'none',message:'이미 종료된 예약은 취소할 수 없습니다.',hoursBefore:0};
+  if(r.status==='arrived')return {allowed:false,late:false,depositOutcome:'none',message:'도착 처리된 예약은 일반 취소할 수 없습니다.',hoursBefore:0};
   const hours=(new Date(r.startAt).getTime()-new Date(at).getTime())/3600000;const late=hours<state.policy.cancellationHours;
   let depositOutcome:'refund'|'forfeit'|'none'='none';
   if(r.depositStatus==='paid')depositOutcome=late&&state.policy.lateCancelForfeit?'forfeit':'refund';
   return {allowed:true,late,depositOutcome,message:late?`예약 ${state.policy.cancellationHours}시간 이내 취소입니다.`:'정상 취소 가능 구간입니다.',hoursBefore:hours};
 }
 export function canMarkNoShow(state:AppState,r:Reservation,at=state.simulatedNow){
-  if(!['requested','confirmed'].includes(r.status))return false;const cutoff=new Date(r.startAt).getTime()+state.policy.noShowGraceMin*60000;return new Date(at).getTime()>=cutoff;
+  if(r.status!=='confirmed')return false;const cutoff=new Date(r.startAt).getTime()+state.policy.noShowGraceMin*60000;return new Date(at).getTime()>=cutoff;
 }
 export function cancelledSlot(r:Reservation):SlotRef|null{return r.status==='cancelled'?{reservationId:r.id,serviceId:r.serviceId,staffId:r.staffId,startAt:r.startAt,endAt:r.endAt}:null;}
 export function waitlistMatches(state:AppState,slot:SlotRef){return state.waitlist.filter(w=>w.status==='waiting'&&w.serviceId===slot.serviceId&&(!w.staffId||w.staffId===slot.staffId)&&new Date(w.windowStart)<=new Date(slot.startAt)&&new Date(w.windowEnd)>=new Date(slot.endAt));}
@@ -45,3 +46,7 @@ export function serviceLabel(state:AppState,id:string){return state.services.fin
 export function customerLabel(state:AppState,id:string){return state.customers.find(c=>c.id===id)?.name??id;}
 export function staffLabel(state:AppState,id:string){return state.staff.find(s=>s.id===id)?.name??id;}
 export function depositFor(service:Service,state:AppState){return state.policy.requireDeposit?service.deposit:0;}
+// Whether a deposit is required is fixed when the reservation is created (depositStatus 'not_required' = none needed, 'unpaid' = still owed);
+// the global requireDeposit policy is never consulted again for an existing reservation. A deposit can no longer be paid once the reservation is over.
+export function depositClosed(r:Reservation){return ['cancelled','completed','no_show'].includes(r.status);}
+export function canPayDeposit(r:Reservation){return !depositClosed(r)&&r.depositStatus==='unpaid';}
