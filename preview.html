@@ -3890,6 +3890,374 @@ function makeSeed(base = new Date()) {
 }
 
 },
+"src/domain/backup":function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MAX_BACKUP_BYTES = exports.RESTORE_CONFIRM_TEXT = exports.BACKUP_LIMITS = void 0;
+exports.validIso = validIso;
+exports.validateState = validateState;
+exports.inspectBackup = inspectBackup;
+exports.backupTooLarge = backupTooLarge;
+exports.canConfirmRestore = canConfirmRestore;
+exports.describeRestore = describeRestore;
+const policy_1 = require("./policy");
+const validation_1 = require("./validation");
+// Strict validation for JSON backups that a user picks for restore (and for LocalRepository.replace).
+// Everything is checked BEFORE anything is stored: structure, field types, allowed status values, duplicate IDs,
+// references between records, real calendar dates and size limits. The result is a freshly built AppState that only contains known fields.
+// The six numeric policy values keep the P0-1 behaviour: unusable values are replaced by defaults (and reported) instead of rejecting the backup.
+// Not checked on purpose: business-state combinations (for example deposit vs. reservation status) and overlapping reservations,
+// because states written by the app itself can already contain them and a backup made by the app must always be restorable.
+exports.BACKUP_LIMITS = { services: 100, staff: 100, customers: 5000, reservations: 3000, waitlist: 3000, audit: 10000 };
+exports.RESTORE_CONFIRM_TEXT = '복원';
+// A UTF-8 file can use up to 3 bytes per counted character; anything bigger is refused before it is even read.
+exports.MAX_BACKUP_BYTES = (0, validation_1.backupLimit)() * 3;
+const MAX_SHOWN_ERRORS = 100;
+const RESERVATION_STATUS = ['requested', 'confirmed', 'arrived', 'completed', 'cancelled', 'no_show'];
+const DEPOSIT_STATUS = ['not_required', 'unpaid', 'paid', 'refunded', 'forfeited'];
+const WAITLIST_STATUS = ['waiting', 'offered', 'booked', 'expired', 'removed'];
+const OFFER_STATUS = ['open', 'accepted', 'declined', 'expired'];
+const SOURCE = ['manual', 'csv', 'waitlist', 'practice'];
+const AUDIT_TYPE = ['reservation', 'deposit', 'cancel', 'noshow', 'waitlist', 'offer', 'policy', 'import', 'system'];
+const isObj = (x) => !!x && typeof x === 'object' && !Array.isArray(x);
+class Issues {
+    list = [];
+    total = 0;
+    add(message) { this.total++; if (this.list.length < MAX_SHOWN_ERRORS)
+        this.list.push(message); }
+}
+function show(v) { let s; try {
+    s = v === undefined ? '없음' : JSON.stringify(v) ?? String(v);
+}
+catch {
+    s = String(v);
+} return s.length > 40 ? s.slice(0, 37) + '…' : s; }
+function tag(kind, index, o) { const id = isObj(o) && typeof o.id === 'string' && o.id ? ` (${o.id.length > 40 ? o.id.slice(0, 37) + '…' : o.id})` : ''; return `${kind} ${index + 1}번째${id}`; }
+function str(o, k, at, c, max = 5000, nonEmpty = false) {
+    const v = o[k];
+    if (typeof v !== 'string') {
+        c.add(`${at}: ${k}는 문자열이어야 합니다 (현재 ${show(v)}).`);
+        return '';
+    }
+    if (nonEmpty && !v.trim()) {
+        c.add(`${at}: ${k}가 비어 있습니다.`);
+        return v;
+    }
+    if (v.length > max) {
+        c.add(`${at}: ${k}가 너무 깁니다 (최대 ${max}자).`);
+        return v.slice(0, max);
+    }
+    return v;
+}
+function optStr(o, k, at, c, max = 5000) { return o[k] === undefined ? undefined : str(o, k, at, c, max); }
+function num(o, k, at, c, r = {}) {
+    const v = o[k];
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+        c.add(`${at}: ${k}는 유한한 숫자여야 합니다 (현재 ${show(v)}).`);
+        return 0;
+    }
+    if (r.integer && !Number.isInteger(v))
+        c.add(`${at}: ${k}는 정수여야 합니다 (현재 ${show(v)}).`);
+    else if ((r.min !== undefined && v < r.min) || (r.max !== undefined && v > r.max))
+        c.add(`${at}: ${k}는 ${r.min ?? '-∞'} 이상 ${r.max ?? '∞'} 이하여야 합니다 (현재 ${show(v)}).`);
+    return v;
+}
+function bool(o, k, at, c) {
+    if (typeof o[k] !== 'boolean') {
+        c.add(`${at}: ${k}는 true 또는 false여야 합니다 (현재 ${show(o[k])}).`);
+        return false;
+    }
+    return o[k];
+}
+function oneOf(o, k, list, at, c) {
+    const v = o[k];
+    if (typeof v !== 'string' || !list.includes(v)) {
+        c.add(`${at}: ${k} 값 ${show(v)}은(는) 허용되지 않습니다 (허용: ${list.join(', ')}).`);
+        return list[0];
+    }
+    return v;
+}
+const ISO = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+function validIso(x) {
+    if (typeof x !== 'string')
+        return false;
+    const m = ISO.exec(x);
+    if (!m)
+        return false;
+    if (Number(m[4]) > 23 || Number(m[5]) > 59 || Number(m[6]) > 59)
+        return false;
+    const day = `${m[1]}-${m[2]}-${m[3]}`;
+    const d = new Date(`${day}T12:00:00Z`);
+    if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== day)
+        return false; // 2026-02-30, month 13, ...
+    return Number.isFinite(Date.parse(x));
+}
+function date(o, k, at, c) {
+    const v = o[k];
+    if (!validIso(v)) {
+        c.add(`${at}: ${k}는 실제로 존재하는 시각(예: 2026-09-29T09:00:00.000Z)이어야 합니다 (현재 ${show(v)}).`);
+        return typeof v === 'string' ? v : '';
+    }
+    return v;
+}
+function optDate(o, k, at, c) { return o[k] === undefined ? undefined : date(o, k, at, c); }
+function id(o, at, c) { return str(o, 'id', at, c, 200, true); }
+function before(a, b) { return validIso(a) && validIso(b) && Date.parse(a) < Date.parse(b); }
+function unique(ids, kind, c) {
+    const seen = new Map();
+    for (const v of ids)
+        if (v)
+            seen.set(v, (seen.get(v) ?? 0) + 1);
+    for (const [v, n] of seen)
+        if (n > 1)
+            c.add(`${kind} ID ${show(v)}가 ${n}번 중복됩니다.`);
+}
+function list(v, name, limit, c, unusable, key) {
+    if (!Array.isArray(v)) {
+        c.add(`${name} 목록이 배열이 아닙니다.`);
+        unusable.add(key);
+        return [];
+    }
+    if (v.length > limit) {
+        c.add(`${name}가 너무 많습니다: ${v.length}개 (최대 ${limit}개).`);
+        unusable.add(key);
+        return [];
+    }
+    return v;
+}
+function parseService(o, i, c) {
+    const at = tag('서비스', i, o);
+    if (!isObj(o)) {
+        c.add(`${at}: 객체가 아닙니다.`);
+        return { id: '', name: '', durationMin: 0, price: 0, deposit: 0, bufferMin: 0, active: false };
+    }
+    return { id: id(o, at, c), name: str(o, 'name', at, c, 200, true), durationMin: num(o, 'durationMin', at, c, { min: 1, max: 1440 }), price: num(o, 'price', at, c, { min: 0, max: 1e9 }), deposit: num(o, 'deposit', at, c, { min: 0, max: 1e9 }), bufferMin: num(o, 'bufferMin', at, c, { min: 0, max: 1440 }), active: bool(o, 'active', at, c) };
+}
+function parseStaff(o, i, c) {
+    const at = tag('담당자', i, o);
+    if (!isObj(o)) {
+        c.add(`${at}: 객체가 아닙니다.`);
+        return { id: '', name: '', serviceIds: [], active: false };
+    }
+    let serviceIds = [];
+    if (!Array.isArray(o.serviceIds))
+        c.add(`${at}: serviceIds는 배열이어야 합니다 (현재 ${show(o.serviceIds)}).`);
+    else if (o.serviceIds.length > exports.BACKUP_LIMITS.services)
+        c.add(`${at}: serviceIds가 너무 많습니다.`);
+    else
+        serviceIds = o.serviceIds.map((x, n) => { if (typeof x !== 'string' || !x) {
+            c.add(`${at}: serviceIds[${n}]는 비어 있지 않은 문자열이어야 합니다 (현재 ${show(x)}).`);
+            return '';
+        } return x; });
+    return { id: id(o, at, c), name: str(o, 'name', at, c, 200, true), serviceIds, active: bool(o, 'active', at, c) };
+}
+function parseCustomer(o, i, c) {
+    const at = tag('고객', i, o);
+    if (!isObj(o)) {
+        c.add(`${at}: 객체가 아닙니다.`);
+        return { id: '', name: '', phone: '', email: '', notes: '', visitCount: 0, noShowCount: 0 };
+    }
+    // visitCount / noShowCount only have to be finite numbers: a customer CSV can already put any number there.
+    return { id: id(o, at, c), name: str(o, 'name', at, c, 200, true), phone: str(o, 'phone', at, c, 200), email: str(o, 'email', at, c, 320), notes: str(o, 'notes', at, c), visitCount: num(o, 'visitCount', at, c), noShowCount: num(o, 'noShowCount', at, c) };
+}
+function parseReservation(o, i, c) {
+    const at = tag('예약', i, o);
+    const empty = { id: '', customerId: '', serviceId: '', staffId: '', startAt: '', endAt: '', status: 'requested', depositStatus: 'not_required', depositAmount: 0, createdAt: '', source: 'manual', note: '' };
+    if (!isObj(o)) {
+        c.add(`${at}: 객체가 아닙니다.`);
+        return empty;
+    }
+    const r = { id: id(o, at, c), customerId: str(o, 'customerId', at, c, 200, true), serviceId: str(o, 'serviceId', at, c, 200, true), staffId: str(o, 'staffId', at, c, 200, true), startAt: date(o, 'startAt', at, c), endAt: date(o, 'endAt', at, c), status: oneOf(o, 'status', RESERVATION_STATUS, at, c), depositStatus: oneOf(o, 'depositStatus', DEPOSIT_STATUS, at, c), depositAmount: num(o, 'depositAmount', at, c, { min: 0, max: 1e9 }), createdAt: date(o, 'createdAt', at, c), source: oneOf(o, 'source', SOURCE, at, c), note: str(o, 'note', at, c) };
+    if (validIso(r.startAt) && validIso(r.endAt) && !before(r.startAt, r.endAt))
+        c.add(`${at}: endAt은 startAt보다 뒤여야 합니다.`);
+    const reason = optStr(o, 'cancelReason', at, c);
+    if (reason !== undefined)
+        r.cancelReason = reason;
+    const cancelledAt = optDate(o, 'cancelledAt', at, c);
+    if (cancelledAt !== undefined)
+        r.cancelledAt = cancelledAt;
+    const from = optStr(o, 'recoveredFromReservationId', at, c, 200);
+    if (from !== undefined)
+        r.recoveredFromReservationId = from;
+    const wid = optStr(o, 'waitlistId', at, c, 200);
+    if (wid !== undefined)
+        r.waitlistId = wid;
+    return r;
+}
+function parseOffer(o, at, c) {
+    if (o === undefined)
+        return undefined;
+    const a = `${at}의 제안(offer)`;
+    if (!isObj(o)) {
+        c.add(`${a}: 객체가 아닙니다.`);
+        return undefined;
+    }
+    const offer = { slotStart: date(o, 'slotStart', a, c), slotEnd: date(o, 'slotEnd', a, c), staffId: str(o, 'staffId', a, c, 200, true), cancelledReservationId: str(o, 'cancelledReservationId', a, c, 200, true), sentAt: date(o, 'sentAt', a, c), expiresAt: date(o, 'expiresAt', a, c), status: oneOf(o, 'status', OFFER_STATUS, a, c) };
+    if (validIso(offer.slotStart) && validIso(offer.slotEnd) && !before(offer.slotStart, offer.slotEnd))
+        c.add(`${a}: slotEnd는 slotStart보다 뒤여야 합니다.`);
+    return offer;
+}
+function parseWaitlist(o, i, c) {
+    const at = tag('대기자', i, o);
+    const empty = { id: '', customerId: '', serviceId: '', staffId: null, windowStart: '', windowEnd: '', status: 'waiting', createdAt: '', note: '' };
+    if (!isObj(o)) {
+        c.add(`${at}: 객체가 아닙니다.`);
+        return empty;
+    }
+    let staffId = null;
+    if (o.staffId === null)
+        staffId = null;
+    else
+        staffId = str(o, 'staffId', at, c, 200, true);
+    const w = { id: id(o, at, c), customerId: str(o, 'customerId', at, c, 200, true), serviceId: str(o, 'serviceId', at, c, 200, true), staffId, windowStart: date(o, 'windowStart', at, c), windowEnd: date(o, 'windowEnd', at, c), status: oneOf(o, 'status', WAITLIST_STATUS, at, c), createdAt: date(o, 'createdAt', at, c), note: str(o, 'note', at, c) };
+    if (validIso(w.windowStart) && validIso(w.windowEnd) && !before(w.windowStart, w.windowEnd))
+        c.add(`${at}: windowEnd는 windowStart보다 뒤여야 합니다.`);
+    const offer = parseOffer(o.offer, at, c);
+    if (offer)
+        w.offer = offer;
+    // The engine keeps these in step: an entry is "offered" exactly while its offer is open, and "booked" only after the offer was accepted.
+    if (w.status === 'offered' && (!offer || offer.status !== 'open'))
+        c.add(`${at}: status가 offered이면 상태가 open인 제안(offer)이 있어야 합니다.`);
+    if (offer && offer.status === 'open' && w.status !== 'offered')
+        c.add(`${at}: 제안(offer)이 open이면 status는 offered여야 합니다 (현재 ${show(w.status)}).`);
+    if (w.status === 'booked' && (!offer || offer.status !== 'accepted'))
+        c.add(`${at}: status가 booked이면 수락된(accepted) 제안(offer)이 있어야 합니다.`);
+    return w;
+}
+function parseAudit(o, i, c) {
+    const at = tag('감사 이력', i, o);
+    if (!isObj(o)) {
+        c.add(`${at}: 객체가 아닙니다.`);
+        return { id: '', at: '', type: 'system', entityId: '', message: '' };
+    }
+    return { id: id(o, at, c), at: date(o, 'at', at, c), type: oneOf(o, 'type', AUDIT_TYPE, at, c), entityId: str(o, 'entityId', at, c, 200), message: str(o, 'message', at, c) };
+}
+function parsePolicy(v, c) {
+    const at = '정책(policy)';
+    if (!isObj(v)) {
+        c.add(`${at}이 객체가 아닙니다.`);
+        return null;
+    }
+    const fixed = (0, policy_1.repairPolicy)(v);
+    const p = fixed.policy;
+    return { policy: { businessName: str(v, 'businessName', at, c, 200), openingHour: p.openingHour, closingHour: p.closingHour, slotMinutes: p.slotMinutes, cancellationHours: p.cancellationHours, noShowGraceMin: p.noShowGraceMin, offerHoldMin: p.offerHoldMin, requireDeposit: bool(v, 'requireDeposit', at, c), lateCancelForfeit: bool(v, 'lateCancelForfeit', at, c), noShowForfeit: bool(v, 'noShowForfeit', at, c) }, fixes: fixed.fixes };
+}
+function validateState(value) {
+    const c = new Issues();
+    const notes = [];
+    if (!isObj(value)) {
+        c.add('백업 데이터가 객체가 아닙니다.');
+        return { ok: false, errors: c.list, totalErrors: c.total, notes };
+    }
+    if (value.schemaVersion !== 1)
+        c.add(`지원하지 않는 백업 버전입니다 (schemaVersion ${show(value.schemaVersion)}, 필요: 1).`);
+    const revision = num(value, 'revision', '백업', c, { min: 0, integer: true });
+    const simulatedNow = date(value, 'simulatedNow', '백업', c);
+    const unusable = new Set();
+    const services = list(value.services, '서비스', exports.BACKUP_LIMITS.services, c, unusable, 'services').map((o, i) => parseService(o, i, c));
+    const staff = list(value.staff, '담당자', exports.BACKUP_LIMITS.staff, c, unusable, 'staff').map((o, i) => parseStaff(o, i, c));
+    const customers = list(value.customers, '고객', exports.BACKUP_LIMITS.customers, c, unusable, 'customers').map((o, i) => parseCustomer(o, i, c));
+    const reservations = list(value.reservations, '예약', exports.BACKUP_LIMITS.reservations, c, unusable, 'reservations').map((o, i) => parseReservation(o, i, c));
+    const waitlist = list(value.waitlist, '대기자', exports.BACKUP_LIMITS.waitlist, c, unusable, 'waitlist').map((o, i) => parseWaitlist(o, i, c));
+    const audit = list(value.audit, '감사 이력', exports.BACKUP_LIMITS.audit, c, unusable, 'audit').map((o, i) => parseAudit(o, i, c));
+    const parsedPolicy = parsePolicy(value.policy, c);
+    unique(services.map(x => x.id), '서비스', c);
+    unique(staff.map(x => x.id), '담당자', c);
+    unique(customers.map(x => x.id), '고객', c);
+    unique(reservations.map(x => x.id), '예약', c);
+    unique(waitlist.map(x => x.id), '대기자', c);
+    unique(audit.map(x => x.id), '감사 이력', c);
+    const ids = (a) => new Set(a.map(x => x.id).filter(Boolean));
+    const serviceIds = ids(services), staffIds = ids(staff), customerIds = ids(customers), reservationIds = ids(reservations), waitlistIds = ids(waitlist);
+    const ref = (set, key, target, at, field, label) => { if (target && !unusable.has(key) && !set.has(target))
+        c.add(`${at}: ${field} ${show(target)}에 해당하는 ${label}이(가) 백업에 없습니다.`); };
+    staff.forEach((s, i) => s.serviceIds.forEach(sid => ref(serviceIds, 'services', sid, tag('담당자', i, s), 'serviceIds', '서비스')));
+    reservations.forEach((r, i) => {
+        const at = tag('예약', i, r);
+        ref(customerIds, 'customers', r.customerId, at, 'customerId', '고객');
+        ref(serviceIds, 'services', r.serviceId, at, 'serviceId', '서비스');
+        ref(staffIds, 'staff', r.staffId, at, 'staffId', '담당자');
+        if (r.recoveredFromReservationId !== undefined) {
+            if (r.recoveredFromReservationId === r.id)
+                c.add(`${at}: recoveredFromReservationId가 자기 자신입니다.`);
+            else
+                ref(reservationIds, 'reservations', r.recoveredFromReservationId, at, 'recoveredFromReservationId', '원본 예약');
+        }
+        if (r.waitlistId !== undefined)
+            ref(waitlistIds, 'waitlist', r.waitlistId, at, 'waitlistId', '대기자');
+    });
+    waitlist.forEach((w, i) => {
+        const at = tag('대기자', i, w);
+        ref(customerIds, 'customers', w.customerId, at, 'customerId', '고객');
+        ref(serviceIds, 'services', w.serviceId, at, 'serviceId', '서비스');
+        if (w.staffId !== null)
+            ref(staffIds, 'staff', w.staffId, at, 'staffId', '담당자');
+        if (w.offer) {
+            ref(staffIds, 'staff', w.offer.staffId, `${at}의 제안(offer)`, 'staffId', '담당자');
+            ref(reservationIds, 'reservations', w.offer.cancelledReservationId, `${at}의 제안(offer)`, 'cancelledReservationId', '취소된 원본 예약');
+        }
+    });
+    if (c.total > 0 || !parsedPolicy)
+        return { ok: false, errors: c.list, totalErrors: c.total, notes };
+    const state = { schemaVersion: 1, revision, simulatedNow, services, staff, customers, reservations, waitlist, policy: parsedPolicy.policy, audit };
+    if (parsedPolicy.fixes.length) {
+        const message = `불러온 정책 값이 올바르지 않아 기본값으로 바꿨습니다: ${parsedPolicy.fixes.join(', ')}`;
+        state.audit.unshift({ id: `AUD-POLICY-${Date.now().toString(36)}`, at: simulatedNow, type: 'policy', entityId: 'policy', message });
+        if (state.audit.length > exports.BACKUP_LIMITS.audit)
+            state.audit.length = exports.BACKUP_LIMITS.audit;
+        notes.push(message);
+    }
+    return { ok: true, errors: [], totalErrors: 0, state, notes };
+}
+function inspectBackup(raw) {
+    const fail = (m) => ({ ok: false, errors: [m], totalErrors: 1, notes: [] });
+    if (typeof raw !== 'string')
+        return fail('백업 내용을 읽지 못했습니다.');
+    if (raw.length > (0, validation_1.backupLimit)())
+        return fail(`백업 파일이 너무 큽니다 (${raw.length.toLocaleString('ko-KR')}자, 한도 ${(0, validation_1.backupLimit)().toLocaleString('ko-KR')}자). 약 4MB 이하로 줄여 주세요.`);
+    if (!raw.trim())
+        return fail('빈 파일입니다.');
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        return fail('JSON 문법이 올바르지 않아 읽을 수 없습니다. 이 앱에서 내려받은 백업 파일을 선택하세요.');
+    }
+    return validateState(parsed);
+}
+function backupTooLarge(bytes) { return bytes > exports.MAX_BACKUP_BYTES; }
+// The final restore button is only usable for a valid backup AND the exact confirmation word.
+function canConfirmRestore(result, typed) { return !!result && result.ok && !!result.state && typed === exports.RESTORE_CONFIRM_TEXT; }
+const RES_LABEL = { requested: '요청', confirmed: '확정', arrived: '도착', completed: '완료', cancelled: '취소', no_show: '노쇼' };
+const WAIT_LABEL = { waiting: '대기', offered: '제안 중', booked: '예약 회복', expired: '만료', removed: '제거' };
+const POLICY_FLAGS = [['requireDeposit', '예약금 사용'], ['lateCancelForfeit', '늦은 취소 시 차감'], ['noShowForfeit', '노쇼 시 차감']];
+// What replacing the current data with the backup will change; shown in the restore preview before anything is written.
+function describeRestore(current, next) {
+    const count = (a) => a.length;
+    const rows = [
+        { label: '서비스', current: count(current.services), next: count(next.services) }, { label: '담당자', current: count(current.staff), next: count(next.staff) },
+        { label: '고객', current: count(current.customers), next: count(next.customers) }, { label: '예약', current: count(current.reservations), next: count(next.reservations) },
+        { label: '대기자', current: count(current.waitlist), next: count(next.waitlist) }, { label: '감사 이력', current: count(current.audit), next: count(next.audit) }
+    ];
+    const reservationStatus = Object.keys(RES_LABEL).map(s => ({ label: `예약 ${RES_LABEL[s]}`, current: current.reservations.filter(r => r.status === s).length, next: next.reservations.filter(r => r.status === s).length }));
+    const waitlistStatus = Object.keys(WAIT_LABEL).map(s => ({ label: `대기자 ${WAIT_LABEL[s]}`, current: current.waitlist.filter(w => w.status === s).length, next: next.waitlist.filter(w => w.status === s).length }));
+    const diff = (a, b) => { const bs = new Set(b.map(x => x.id)); return a.filter(x => !bs.has(x.id)).length; };
+    const onlyInCurrent = [{ label: '고객', current: diff(current.customers, next.customers), next: 0 }, { label: '예약', current: diff(current.reservations, next.reservations), next: 0 }, { label: '대기자', current: diff(current.waitlist, next.waitlist), next: 0 }];
+    const onlyInBackup = [{ label: '고객', current: 0, next: diff(next.customers, current.customers) }, { label: '예약', current: 0, next: diff(next.reservations, current.reservations) }, { label: '대기자', current: 0, next: diff(next.waitlist, current.waitlist) }];
+    const policyChanges = [];
+    if (current.policy.businessName !== next.policy.businessName)
+        policyChanges.push(`사업장 이름 ${JSON.stringify(current.policy.businessName)} → ${JSON.stringify(next.policy.businessName)}`);
+    for (const f of Object.keys(policy_1.POLICY_LIMITS))
+        if (current.policy[f] !== next.policy[f])
+            policyChanges.push(`${policy_1.POLICY_LIMITS[f].label} ${current.policy[f]} → ${next.policy[f]}`);
+    for (const [f, label] of POLICY_FLAGS)
+        if (current.policy[f] !== next.policy[f])
+            policyChanges.push(`${label} ${current.policy[f] ? '켬' : '끔'} → ${next.policy[f] ? '켬' : '끔'}`);
+    return { rows, reservationStatus, waitlistStatus, onlyInCurrent, onlyInBackup, policyChanges, clock: { current: current.simulatedNow, next: next.simulatedNow } };
+}
+
+},
 "src/domain/engine":function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
@@ -4165,6 +4533,8 @@ exports.parseBackupWithNotes = parseBackupWithNotes;
 exports.parseBackup = parseBackup;
 exports.backupLimit = backupLimit;
 const policy_1 = require("./policy");
+// NOTE: parseState* / parseBackup* below are the LENIENT loaders used when reading the app's own localStorage (plus the P0-1 policy repair).
+// Restoring a backup a user picked must go through inspectBackup / validateState in ./backup, which check every record.
 const MAX_BACKUP_CHARS = 4_200_000;
 function arr(v, name) { if (!Array.isArray(v))
     throw Error(`${name} 목록 형식이 아닙니다.`); return v; }
@@ -4300,6 +4670,7 @@ exports.LocalRepository = exports.STORAGE_KEY = void 0;
 exports.browserRepository = browserRepository;
 const seed_1 = require("../data/seed");
 const validation_1 = require("../domain/validation");
+const backup_1 = require("../domain/backup");
 exports.STORAGE_KEY = 'reservation-noshow-lab:state:v1';
 class LocalRepository {
     storage;
@@ -4344,7 +4715,9 @@ class LocalRepository {
     catch {
         throw Error('브라우저 저장 용량 또는 권한 문제로 반영하지 못했습니다. 기존 자료는 유지됩니다. JSON 백업 후 공간을 확보하세요.');
     } this.expected = raw; }
-    replace(state) { const clean = (0, validation_1.parseState)(state); if (!this.storage) {
+    // Whole-state replacement (backup restore / reset). The data is fully validated BEFORE anything is written, so an invalid backup can never touch the stored data.
+    replace(state) { const checked = (0, backup_1.validateState)(state); if (!checked.ok || !checked.state)
+        throw Error(`복원할 자료가 올바르지 않아 복원하지 않았습니다. 현재 자료는 바뀌지 않았습니다. ${checked.errors.slice(0, 3).join(' / ')}`); const clean = checked.state; if (!this.storage) {
         this.session = clean;
         this.blocked = false;
         return;
@@ -5134,60 +5507,170 @@ const engine_1 = require("../domain/engine");
 const rules_1 = require("../domain/rules");
 const files_1 = require("../lib/files");
 const validation_1 = require("../domain/validation");
-function Settings() { const { state, run, replace, reset, raw } = (0, store_1.useData)(); const [clock, setClock] = (0, react_1.useState)((0, rules_1.localInput)(state.simulatedNow)); const [confirm, setConfirm] = (0, react_1.useState)(false); const input = (0, react_1.useRef)(null); const rawText = raw() ?? JSON.stringify(state); const usage = Math.min(100, Math.round(rawText.length / 5_200_000 * 100)); function backup() { (0, files_1.downloadText)(`reservation-lab-backup-${Date.now()}.json`, JSON.stringify(state, null, 2), 'application/json;charset=utf-8'); } async function restore(file) { try {
-    const text = await file.text();
-    const parsed = (0, validation_1.parseBackupWithNotes)(text);
-    replace(parsed.state, parsed.notes.length ? '백업을 복원했습니다. 올바르지 않은 정책 값은 기본값으로 바꿨습니다(감사 이력에 기록).' : '백업을 복원했습니다.');
-}
-catch (e) {
-    alert(e.message);
-}
-finally {
-    if (input.current)
-        input.current.value = '';
-} } return react_1.default.createElement(react_1.default.Fragment, null,
-    react_1.default.createElement(ui_1.PageHeading, { eyebrow: "LOCAL STORAGE & BACKUP", title: "\uC124\uC815 \u00B7 \uBC31\uC5C5", description: "\uC2E4\uC2B5 \uC2DC\uAC01\uC744 \uC6C0\uC9C1\uC5EC \uC2DC\uAC04 \uC758\uC874 \uADDC\uCE59\uC744 \uC2DC\uD5D8\uD558\uACE0, \uB85C\uCEEC \uC790\uB8CC\uB97C JSON\uC73C\uB85C \uBC31\uC5C5\u00B7\uBCF5\uC6D0\uD569\uB2C8\uB2E4." }),
-    react_1.default.createElement(ui_1.Help, { title: "\uBC31\uC5D4\uB4DC \uC5C6\uB294 \uC571\uC758 \uACBD\uACC4" }, "\uBE0C\uB77C\uC6B0\uC800 \uC800\uC7A5\uC740 \uD55C \uC0AC\uB78C\uC758 \uD55C \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC30\uC6B0\uAE30\uC5D0\uB294 \uD3B8\uD558\uC9C0\uB9CC \uD300 \uB3D9\uC2DC \uC791\uC5C5, \uC11C\uBC84 \uBC31\uC5C5, \uC9C4\uC9DC \uB85C\uADF8\uC778 \uAD8C\uD55C\uC740 \uC81C\uACF5\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uADF8\uB798\uC11C \uB370\uC774\uD130\uB97C \uD30C\uC77C\uB85C \uAEBC\uB0BC \uC218 \uC788\uAC8C \uD574 \uB461\uB2C8\uB2E4."),
-    react_1.default.createElement("div", { className: "two-column" },
-        react_1.default.createElement("section", { className: "panel" },
-            react_1.default.createElement("h2", null, "\uC2E4\uC2B5 \uC2DC\uAC01"),
-            react_1.default.createElement(ui_1.Field, { label: "\uD604\uC7AC \uAC00\uC0C1 \uC2DC\uAC01", hint: "\uB178\uC1FC\u00B7\uCDE8\uC18C \uAE30\uC900\uC740 \uC2E4\uC81C \uCEF4\uD4E8\uD130 \uC2DC\uACC4\uAC00 \uC544\uB2C8\uB77C \uC774 \uAC12\uC744 \uC0AC\uC6A9\uD569\uB2C8\uB2E4." },
-                react_1.default.createElement("input", { type: "datetime-local", value: clock, onChange: e => setClock(e.target.value) })),
-            react_1.default.createElement("div", { className: "action-row" },
-                react_1.default.createElement(ui_1.Button, { variant: "primary", onClick: () => run(s => (0, engine_1.changeClock)(s, new Date(clock).toISOString()), '실습 시각을 변경했습니다.') }, "\uC2DC\uAC01 \uC801\uC6A9"),
-                react_1.default.createElement(ui_1.Button, { onClick: () => { const d = new Date(state.simulatedNow); d.setMinutes(d.getMinutes() + 30); setClock((0, rules_1.localInput)(d.toISOString())); run(s => (0, engine_1.changeClock)(s, d.toISOString()), '30분 이동했습니다.'); } }, "+30\uBD84"),
-                react_1.default.createElement(ui_1.Button, { onClick: () => { const d = new Date(state.simulatedNow); d.setDate(d.getDate() + 1); setClock((0, rules_1.localInput)(d.toISOString())); run(s => (0, engine_1.changeClock)(s, d.toISOString()), '하루 이동했습니다.'); } }, "+1\uC77C"))),
-        react_1.default.createElement("section", { className: "panel" },
-            react_1.default.createElement("h2", null, "\uBE0C\uB77C\uC6B0\uC800 \uC800\uC7A5"),
-            react_1.default.createElement("div", { className: "detail-row" },
-                react_1.default.createElement("span", null, "\uD604\uC7AC JSON \uD06C\uAE30"),
+const backup_1 = require("../domain/backup");
+const fmtDelta = (a, b) => b === a ? '변화 없음' : `${b > a ? '+' : ''}${b - a}`;
+const fmtTime = (iso) => new Date(iso).toLocaleString('ko-KR', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const failure = (name, size, message) => ({ name, size, result: { ok: false, errors: [message], totalErrors: 1, notes: [] } });
+function Settings() {
+    const { state, run, replace, reset, raw } = (0, store_1.useData)();
+    const [clock, setClock] = (0, react_1.useState)((0, rules_1.localInput)(state.simulatedNow));
+    const [confirm, setConfirm] = (0, react_1.useState)(false);
+    const input = (0, react_1.useRef)(null);
+    const rawText = raw() ?? JSON.stringify(state);
+    const usage = Math.min(100, Math.round(rawText.length / 5_200_000 * 100));
+    const [pending, setPending] = (0, react_1.useState)(null);
+    const [typed, setTyped] = (0, react_1.useState)('');
+    const [failed, setFailed] = (0, react_1.useState)('');
+    const [last, setLast] = (0, react_1.useState)('');
+    function backup() { (0, files_1.downloadText)(`reservation-lab-backup-${Date.now()}.json`, JSON.stringify(state, null, 2), 'application/json;charset=utf-8'); }
+    // Step 1: picking a file never changes anything. It is only read and inspected; the result decides which dialog is shown.
+    async function pick(file) { setFailed(''); setTyped(''); try {
+        if ((0, backup_1.backupTooLarge)(file.size)) {
+            setPending(failure(file.name, file.size, `백업 파일이 너무 큽니다 (${(file.size / 1e6).toFixed(1)}MB). 약 4MB 이하로 줄여 주세요.`));
+            return;
+        }
+        const text = await file.text();
+        setPending({ name: file.name, size: file.size, result: (0, backup_1.inspectBackup)(text) });
+    }
+    catch (e) {
+        setPending(failure(file.name, file.size, `파일을 읽지 못했습니다: ${e.message}`));
+    }
+    finally {
+        if (input.current)
+            input.current.value = '';
+    } }
+    function closeRestore() { setPending(null); setTyped(''); setFailed(''); }
+    // Step 2: only a valid inspection plus the exact confirmation word can restore. If saving fails, the current data stays as it is.
+    function apply() { if (!pending || !pending.result.state || !(0, backup_1.canConfirmRestore)(pending.result, typed))
+        return; const next = pending.result.state; const notes = pending.result.notes; const message = notes.length ? '백업을 복원했습니다. 올바르지 않은 정책 값은 기본값으로 바꿨습니다(감사 이력에 기록).' : '백업을 복원했습니다.'; if (replace(next, message)) {
+        setLast(`${pending.name} · 예약 ${next.reservations.length}건 · 고객 ${next.customers.length}명 · 대기자 ${next.waitlist.length}건${notes.length ? ' · 정책 값 자동 복구' : ''}`);
+        closeRestore();
+    }
+    else
+        setFailed('복원을 저장하지 못했습니다. 현재 자료는 그대로입니다. 브라우저 저장 공간을 확인한 뒤 다시 시도하세요.'); }
+    const summary = pending && pending.result.ok && pending.result.state ? (0, backup_1.describeRestore)(state, pending.result.state) : null;
+    return react_1.default.createElement(react_1.default.Fragment, null,
+        react_1.default.createElement(ui_1.PageHeading, { eyebrow: "LOCAL STORAGE & BACKUP", title: "\uC124\uC815 \u00B7 \uBC31\uC5C5", description: "\uC2E4\uC2B5 \uC2DC\uAC01\uC744 \uC6C0\uC9C1\uC5EC \uC2DC\uAC04 \uC758\uC874 \uADDC\uCE59\uC744 \uC2DC\uD5D8\uD558\uACE0, \uB85C\uCEEC \uC790\uB8CC\uB97C JSON\uC73C\uB85C \uBC31\uC5C5\u00B7\uBCF5\uC6D0\uD569\uB2C8\uB2E4." }),
+        react_1.default.createElement(ui_1.Help, { title: "\uBC31\uC5D4\uB4DC \uC5C6\uB294 \uC571\uC758 \uACBD\uACC4" }, "\uBE0C\uB77C\uC6B0\uC800 \uC800\uC7A5\uC740 \uD55C \uC0AC\uB78C\uC758 \uD55C \uBE0C\uB77C\uC6B0\uC800\uC5D0\uC11C \uBC30\uC6B0\uAE30\uC5D0\uB294 \uD3B8\uD558\uC9C0\uB9CC \uD300 \uB3D9\uC2DC \uC791\uC5C5, \uC11C\uBC84 \uBC31\uC5C5, \uC9C4\uC9DC \uB85C\uADF8\uC778 \uAD8C\uD55C\uC740 \uC81C\uACF5\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uADF8\uB798\uC11C \uB370\uC774\uD130\uB97C \uD30C\uC77C\uB85C \uAEBC\uB0BC \uC218 \uC788\uAC8C \uD574 \uB461\uB2C8\uB2E4."),
+        react_1.default.createElement("div", { className: "two-column" },
+            react_1.default.createElement("section", { className: "panel" },
+                react_1.default.createElement("h2", null, "\uC2E4\uC2B5 \uC2DC\uAC01"),
+                react_1.default.createElement(ui_1.Field, { label: "\uD604\uC7AC \uAC00\uC0C1 \uC2DC\uAC01", hint: "\uB178\uC1FC\u00B7\uCDE8\uC18C \uAE30\uC900\uC740 \uC2E4\uC81C \uCEF4\uD4E8\uD130 \uC2DC\uACC4\uAC00 \uC544\uB2C8\uB77C \uC774 \uAC12\uC744 \uC0AC\uC6A9\uD569\uB2C8\uB2E4." },
+                    react_1.default.createElement("input", { type: "datetime-local", value: clock, onChange: e => setClock(e.target.value) })),
+                react_1.default.createElement("div", { className: "action-row" },
+                    react_1.default.createElement(ui_1.Button, { variant: "primary", onClick: () => run(s => (0, engine_1.changeClock)(s, new Date(clock).toISOString()), '실습 시각을 변경했습니다.') }, "\uC2DC\uAC01 \uC801\uC6A9"),
+                    react_1.default.createElement(ui_1.Button, { onClick: () => { const d = new Date(state.simulatedNow); d.setMinutes(d.getMinutes() + 30); setClock((0, rules_1.localInput)(d.toISOString())); run(s => (0, engine_1.changeClock)(s, d.toISOString()), '30분 이동했습니다.'); } }, "+30\uBD84"),
+                    react_1.default.createElement(ui_1.Button, { onClick: () => { const d = new Date(state.simulatedNow); d.setDate(d.getDate() + 1); setClock((0, rules_1.localInput)(d.toISOString())); run(s => (0, engine_1.changeClock)(s, d.toISOString()), '하루 이동했습니다.'); } }, "+1\uC77C"))),
+            react_1.default.createElement("section", { className: "panel" },
+                react_1.default.createElement("h2", null, "\uBE0C\uB77C\uC6B0\uC800 \uC800\uC7A5"),
+                react_1.default.createElement("div", { className: "detail-row" },
+                    react_1.default.createElement("span", null, "\uD604\uC7AC JSON \uD06C\uAE30"),
+                    react_1.default.createElement("b", null,
+                        Math.round(rawText.length / 1024),
+                        " KB")),
+                react_1.default.createElement("div", { className: "detail-row" },
+                    react_1.default.createElement("span", null, "\uBE0C\uB77C\uC6B0\uC800 5.2M\uC790 \uAC00\uC815 \uC0AC\uC6A9\uB960"),
+                    react_1.default.createElement("b", null,
+                        usage,
+                        "%")),
+                react_1.default.createElement("div", { className: "storage-meter" },
+                    react_1.default.createElement("i", { style: { width: `${usage}%` } })),
+                react_1.default.createElement("p", { className: "panel-sub" },
+                    "\uBC31\uC5C5 \uC785\uB825 \uC790\uCCB4\uB294 \uC57D ",
+                    Math.round((0, validation_1.backupLimit)() / 100000) / 10,
+                    "MB \uBB38\uC790 \uD55C\uB3C4\uB85C \uC81C\uD55C\uD569\uB2C8\uB2E4. \uBE0C\uB77C\uC6B0\uC800\uBCC4 localStorage \uC2E4\uC81C \uD55C\uB3C4\uB294 \uB2E4\uB97C \uC218 \uC788\uC2B5\uB2C8\uB2E4."))),
+        react_1.default.createElement("div", { className: "two-column", style: { marginTop: 18 } },
+            react_1.default.createElement("section", { className: "panel" },
+                react_1.default.createElement("h2", null, "\uBC31\uC5C5 \u00B7 \uBCF5\uC6D0"),
+                react_1.default.createElement("div", { className: "action-row" },
+                    react_1.default.createElement(ui_1.Button, { icon: "download", onClick: backup }, "\uC804\uCCB4 JSON \uBC31\uC5C5"),
+                    react_1.default.createElement(ui_1.Button, { onClick: () => input.current?.click() }, "\uBC31\uC5C5 \uBCF5\uC6D0"),
+                    react_1.default.createElement("input", { ref: input, hidden: true, type: "file", accept: ".json,application/json", "aria-label": "\uBC31\uC5C5 JSON \uD30C\uC77C \uC120\uD0DD", onChange: e => e.target.files?.[0] && pick(e.target.files[0]) })),
+                react_1.default.createElement("div", { className: "notice-box", style: { marginTop: 14 } },
+                    "\uBC31\uC5C5 \uD30C\uC77C\uC744 \uACE0\uB974\uBA74 \uBA3C\uC800 \uAC80\uC0AC\uD558\uACE0 \u2018\uBCF5\uC6D0 \uBBF8\uB9AC\uBCF4\uAE30\u2019\uB97C \uBCF4\uC5EC \uC90D\uB2C8\uB2E4. \uBBF8\uB9AC\uBCF4\uAE30\uC5D0\uC11C \u2018",
+                    backup_1.RESTORE_CONFIRM_TEXT,
+                    "\u2019\uC744 \uC9C1\uC811 \uC785\uB825\uD574\uC57C\uB9CC \uD604\uC7AC \uC790\uB8CC\uAC00 \uAD50\uCCB4\uB429\uB2C8\uB2E4. \uAC80\uC0AC\uC5D0 \uC2E4\uD328\uD558\uAC70\uB098 \uC800\uC7A5 \uACF5\uAC04\uC774 \uBD80\uC871\uD558\uBA74 \uD604\uC7AC \uC790\uB8CC\uB294 \uADF8\uB300\uB85C \uC720\uC9C0\uB429\uB2C8\uB2E4."),
+                last && react_1.default.createElement("div", { className: "notice-box", role: "status", style: { marginTop: 10 } },
+                    react_1.default.createElement("b", null, "\uB9C8\uC9C0\uB9C9 \uBCF5\uC6D0"),
+                    " \u00B7 ",
+                    last)),
+            react_1.default.createElement("section", { className: "panel" },
+                react_1.default.createElement("h2", null, "\uC2E4\uC2B5 \uCD08\uAE30\uD654"),
+                react_1.default.createElement("p", null, "\uD604\uC7AC \uC785\uB825\uD55C \uC790\uB8CC\uB97C \uC9C0\uC6B0\uACE0 \uCC98\uC74C\uC758 \uAC00\uC0C1 \uC608\uC57D\uC810 \uB370\uC774\uD130\uB85C \uB3CC\uC544\uAC11\uB2C8\uB2E4."),
+                react_1.default.createElement(ui_1.Button, { variant: "danger", onClick: () => setConfirm(true) }, "\uAC00\uC0C1 \uC790\uB8CC\uB85C \uCD08\uAE30\uD654"))),
+        confirm && react_1.default.createElement(ui_1.Confirm, { title: "\uC2E4\uC2B5 \uC790\uB8CC\uB97C \uCD08\uAE30\uD654\uD560\uAE4C\uC694?", description: "\uD604\uC7AC \uBE0C\uB77C\uC6B0\uC800\uC758 \uC2E4\uC2B5 \uB370\uC774\uD130\uAC00 \uAE30\uBCF8 \uAC00\uC0C1 \uB370\uC774\uD130\uB85C \uBC14\uB01D\uB2C8\uB2E4. \uD544\uC694\uD55C \uB0B4\uC6A9\uC740 \uBA3C\uC800 JSON \uBC31\uC5C5\uD558\uC138\uC694.", button: "\uCD08\uAE30\uD654", danger: true, onClose: () => setConfirm(false), onConfirm: () => { reset(); setConfirm(false); } }),
+        pending && !pending.result.ok && react_1.default.createElement(ui_1.Modal, { title: "\uBC31\uC5C5 \uD30C\uC77C\uC744 \uBCF5\uC6D0\uD560 \uC218 \uC5C6\uC2B5\uB2C8\uB2E4", onClose: closeRestore },
+            react_1.default.createElement("p", { className: "confirm-copy" },
+                react_1.default.createElement("b", null, pending.name),
+                " \uAC80\uC0AC\uC5D0\uC11C \uC624\uB958 ",
+                pending.result.totalErrors,
+                "\uAC1C\uB97C \uCC3E\uC558\uC2B5\uB2C8\uB2E4. ",
+                react_1.default.createElement("b", null, "\uD604\uC7AC \uC790\uB8CC\uB294 \uC804\uD600 \uBCC0\uACBD\uB418\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4."),
+                " \uC774 \uC571\uC5D0\uC11C \uB0B4\uB824\uBC1B\uC740 \uBC31\uC5C5 \uD30C\uC77C\uC778\uC9C0, \uD30C\uC77C\uC774 \uC218\uC815\uB418\uAC70\uB098 \uC190\uC0C1\uB418\uC9C0 \uC54A\uC558\uB294\uC9C0 \uD655\uC778\uD558\uC138\uC694."),
+            react_1.default.createElement("ul", { className: "issue-list", "aria-label": "\uBC31\uC5C5 \uAC80\uC0AC \uC624\uB958" }, pending.result.errors.slice(0, 20).map((x, i) => react_1.default.createElement("li", { key: i }, x))),
+            pending.result.totalErrors > 20 && react_1.default.createElement("p", { className: "panel-sub" },
+                "\u2026\uC678 ",
+                pending.result.totalErrors - 20,
+                "\uAC1C\uC758 \uC624\uB958\uAC00 \uB354 \uC788\uC2B5\uB2C8\uB2E4."),
+            react_1.default.createElement("div", { className: "modal-actions" },
+                react_1.default.createElement(ui_1.Button, { variant: "primary", onClick: closeRestore }, "\uB2EB\uAE30"))),
+        pending && pending.result.ok && summary && react_1.default.createElement(ui_1.Modal, { title: "\uBC31\uC5C5 \uBCF5\uC6D0 \uBBF8\uB9AC\uBCF4\uAE30", wide: true, onClose: closeRestore },
+            react_1.default.createElement("p", { className: "confirm-copy" },
+                react_1.default.createElement("b", null, pending.name),
+                " (",
+                Math.max(1, Math.round(pending.size / 1024)),
+                " KB)\uC740 \uAC80\uC0AC\uB97C \uD1B5\uACFC\uD588\uC2B5\uB2C8\uB2E4. ",
+                react_1.default.createElement("b", null, "\uC544\uC9C1 \uC544\uBB34\uAC83\uB3C4 \uBC14\uB00C\uC9C0 \uC54A\uC558\uC2B5\uB2C8\uB2E4."),
+                " \uC544\uB798 \uBCC0\uACBD \uB0B4\uC6A9\uC744 \uD655\uC778\uD55C \uB4A4 \uBCF5\uC6D0\uD558\uC138\uC694."),
+            react_1.default.createElement("div", { className: "detail-stack" }, summary.rows.map(r => react_1.default.createElement("div", { className: "detail-row", key: r.label },
+                react_1.default.createElement("span", null, r.label),
                 react_1.default.createElement("b", null,
-                    Math.round(rawText.length / 1024),
-                    " KB")),
-            react_1.default.createElement("div", { className: "detail-row" },
-                react_1.default.createElement("span", null, "\uBE0C\uB77C\uC6B0\uC800 5.2M\uC790 \uAC00\uC815 \uC0AC\uC6A9\uB960"),
+                    r.current,
+                    " \u2192 ",
+                    r.next,
+                    " ",
+                    react_1.default.createElement("small", null,
+                        "(",
+                        fmtDelta(r.current, r.next),
+                        ")"))))),
+            react_1.default.createElement("h3", { style: { marginTop: 16 } }, "\uC608\uC57D\u00B7\uB300\uAE30\uC790 \uC0C1\uD0DC\uBCC4"),
+            react_1.default.createElement("div", { className: "detail-stack" }, [...summary.reservationStatus, ...summary.waitlistStatus].filter(r => r.current || r.next).map(r => react_1.default.createElement("div", { className: "detail-row", key: r.label },
+                react_1.default.createElement("span", null, r.label),
                 react_1.default.createElement("b", null,
-                    usage,
-                    "%")),
-            react_1.default.createElement("div", { className: "storage-meter" },
-                react_1.default.createElement("i", { style: { width: `${usage}%` } })),
-            react_1.default.createElement("p", { className: "panel-sub" },
-                "\uBC31\uC5C5 \uC785\uB825 \uC790\uCCB4\uB294 \uC57D ",
-                Math.round((0, validation_1.backupLimit)() / 100000) / 10,
-                "MB \uBB38\uC790 \uD55C\uB3C4\uB85C \uC81C\uD55C\uD569\uB2C8\uB2E4. \uBE0C\uB77C\uC6B0\uC800\uBCC4 localStorage \uC2E4\uC81C \uD55C\uB3C4\uB294 \uB2E4\uB97C \uC218 \uC788\uC2B5\uB2C8\uB2E4."))),
-    react_1.default.createElement("div", { className: "two-column", style: { marginTop: 18 } },
-        react_1.default.createElement("section", { className: "panel" },
-            react_1.default.createElement("h2", null, "\uBC31\uC5C5 \u00B7 \uBCF5\uC6D0"),
-            react_1.default.createElement("div", { className: "action-row" },
-                react_1.default.createElement(ui_1.Button, { icon: "download", onClick: backup }, "\uC804\uCCB4 JSON \uBC31\uC5C5"),
-                react_1.default.createElement(ui_1.Button, { onClick: () => input.current?.click() }, "\uBC31\uC5C5 \uBCF5\uC6D0"),
-                react_1.default.createElement("input", { ref: input, hidden: true, type: "file", accept: ".json,application/json", onChange: e => e.target.files?.[0] && restore(e.target.files[0]) })),
-            react_1.default.createElement("div", { className: "notice-box", style: { marginTop: 14 } }, "\uBCF5\uC6D0 \uD30C\uC77C\uC740 \uAD6C\uC870 \uAC80\uC0AC\uB97C \uD1B5\uACFC\uD574\uC57C \uD558\uBA70, \uC800\uC7A5 \uACF5\uAC04 \uBD80\uC871\uC73C\uB85C \uC2E4\uD328\uD558\uBA74 \uAE30\uC874 \uC790\uB8CC\uB97C \uC720\uC9C0\uD558\uB3C4\uB85D \uC124\uACC4\uD588\uC2B5\uB2C8\uB2E4.")),
-        react_1.default.createElement("section", { className: "panel" },
-            react_1.default.createElement("h2", null, "\uC2E4\uC2B5 \uCD08\uAE30\uD654"),
-            react_1.default.createElement("p", null, "\uD604\uC7AC \uC785\uB825\uD55C \uC790\uB8CC\uB97C \uC9C0\uC6B0\uACE0 \uCC98\uC74C\uC758 \uAC00\uC0C1 \uC608\uC57D\uC810 \uB370\uC774\uD130\uB85C \uB3CC\uC544\uAC11\uB2C8\uB2E4."),
-            react_1.default.createElement(ui_1.Button, { variant: "danger", onClick: () => setConfirm(true) }, "\uAC00\uC0C1 \uC790\uB8CC\uB85C \uCD08\uAE30\uD654"))),
-    confirm && react_1.default.createElement(ui_1.Confirm, { title: "\uC2E4\uC2B5 \uC790\uB8CC\uB97C \uCD08\uAE30\uD654\uD560\uAE4C\uC694?", description: "\uD604\uC7AC \uBE0C\uB77C\uC6B0\uC800\uC758 \uC2E4\uC2B5 \uB370\uC774\uD130\uAC00 \uAE30\uBCF8 \uAC00\uC0C1 \uB370\uC774\uD130\uB85C \uBC14\uB01D\uB2C8\uB2E4. \uD544\uC694\uD55C \uB0B4\uC6A9\uC740 \uBA3C\uC800 JSON \uBC31\uC5C5\uD558\uC138\uC694.", button: "\uCD08\uAE30\uD654", danger: true, onClose: () => setConfirm(false), onConfirm: () => { reset(); setConfirm(false); } })); }
+                    r.current,
+                    " \u2192 ",
+                    r.next)))),
+            react_1.default.createElement("div", { className: "detail-stack", style: { marginTop: 12 } },
+                react_1.default.createElement("div", { className: "detail-row" },
+                    react_1.default.createElement("span", null, "\uD604\uC7AC\uC5D0\uB9CC \uC788\uC5B4 \uC0AC\uB77C\uC9C0\uB294 \uC790\uB8CC"),
+                    react_1.default.createElement("b", null, summary.onlyInCurrent.map(r => `${r.label} ${r.current}`).join(' · '))),
+                react_1.default.createElement("div", { className: "detail-row" },
+                    react_1.default.createElement("span", null, "\uBC31\uC5C5\uC5D0\uB9CC \uC788\uC5B4 \uC0C8\uB85C \uC0DD\uAE30\uB294 \uC790\uB8CC"),
+                    react_1.default.createElement("b", null, summary.onlyInBackup.map(r => `${r.label} ${r.next}`).join(' · '))),
+                react_1.default.createElement("div", { className: "detail-row" },
+                    react_1.default.createElement("span", null, "\uC2E4\uC2B5 \uC2DC\uAC01"),
+                    react_1.default.createElement("b", null,
+                        fmtTime(summary.clock.current),
+                        " \u2192 ",
+                        fmtTime(summary.clock.next))),
+                react_1.default.createElement("div", { className: "detail-row" },
+                    react_1.default.createElement("span", null, "\uC815\uCC45 \uBCC0\uACBD"),
+                    react_1.default.createElement("b", null, summary.policyChanges.length ? summary.policyChanges.join(' · ') : '변경 없음'))),
+            pending.result.notes.length > 0 && react_1.default.createElement("div", { className: "notice-box", role: "status", style: { marginTop: 12, background: '#fff8e6', borderColor: '#f0d9a0' } },
+                react_1.default.createElement("b", null, "\uC815\uCC45 \uAC12 \uC790\uB3D9 \uBCF5\uAD6C"),
+                react_1.default.createElement("br", null),
+                "\uBC31\uC5C5\uC758 \uC815\uCC45 \uAC12 \uC77C\uBD80\uAC00 \uC62C\uBC14\uB974\uC9C0 \uC54A\uC544 \uBCF5\uC6D0\uD560 \uB54C \uAE30\uBCF8\uAC12\uC73C\uB85C \uBC14\uAFC9\uB2C8\uB2E4. \uB098\uBA38\uC9C0 \uC790\uB8CC\uB294 \uADF8\uB300\uB85C \uBCF5\uC6D0\uB418\uBA70, \uBCF5\uAD6C \uB0B4\uC6A9\uC740 \uAC10\uC0AC \uC774\uB825\uC5D0 \uAE30\uB85D\uB429\uB2C8\uB2E4.",
+                react_1.default.createElement("br", null),
+                react_1.default.createElement("small", null, pending.result.notes.join(' '))),
+            react_1.default.createElement("div", { className: "notice-box", style: { marginTop: 12, background: '#fff3f2', borderColor: '#f1c9c5', color: '#9b3933' } }, "\uD604\uC7AC \uC790\uB8CC \uC804\uCCB4\uAC00 \uC704 \uBC31\uC5C5\uC73C\uB85C \uAD50\uCCB4\uB429\uB2C8\uB2E4. \uAE30\uC874 \uC790\uB8CC\uC640 \uBCD1\uD569\uD558\uC9C0 \uC54A\uC2B5\uB2C8\uB2E4. \uD604\uC7AC \uC790\uB8CC\uAC00 \uD544\uC694\uD558\uBA74 \uBA3C\uC800 \u2018\uC804\uCCB4 JSON \uBC31\uC5C5\u2019\uC744 \uBC1B\uC73C\uC138\uC694."),
+            react_1.default.createElement(ui_1.Field, { label: `계속하려면 ‘${backup_1.RESTORE_CONFIRM_TEXT}’을 입력하세요` },
+                react_1.default.createElement("input", { value: typed, onChange: e => setTyped(e.target.value), autoComplete: "off", "aria-label": "\uBCF5\uC6D0 \uD655\uC778 \uBB38\uAD6C" })),
+            failed && react_1.default.createElement("ul", { className: "issue-list", role: "alert" },
+                react_1.default.createElement("li", null, failed)),
+            react_1.default.createElement("div", { className: "modal-actions" },
+                react_1.default.createElement(ui_1.Button, { onClick: closeRestore }, "\uCDE8\uC18C"),
+                react_1.default.createElement(ui_1.Button, { variant: "primary", disabled: !(0, backup_1.canConfirmRestore)(pending.result, typed), onClick: apply }, "\uC804\uCCB4 \uC790\uB8CC \uBCF5\uC6D0"))));
+}
 
 },
 "src/pages/Waitlist":function(require,module,exports){
