@@ -15,7 +15,7 @@ This is Business Model 02 of a 30-project learning series. The user is learning 
 
 ## Session start and scope
 - Work only inside the currently selected repository (`02-reservation-noshow-dashboard`). Do not browse, read, or modify other numbered projects (01, 03, ...) or parent folders.
-- At the start of every new session, read `PROJECT_STATE.md` and `BUSINESS_MODEL.md` first. They hold the current state, known risks, and the single next task. Update `PROJECT_STATE.md` when a task is finished.
+- At the start of every new session, read `PROJECT_STATE.md` and `BUSINESS_MODEL.md` first. They hold the current phase, known risks, and the backlog. The next task is whatever the user assigns; backlog items are not started unless the user asks. Update `PROJECT_STATE.md` when a task is finished.
 
 ## Workflow
 - One P0 at a time. Do not start the next P0 or mix unrelated changes into one commit.

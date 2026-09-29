@@ -10,7 +10,7 @@
 | Node 22 | P0-3 검증 당시 `npm ci`, `typecheck`, `typecheck:domain`, `test`(118/118), `build`, `build:vite` 모두 통과 (이전 세션 기록. 이 문서를 갱신한 세션이 Node 22로 재실행하지는 않았음) |
 | Node 24 (24.19.0, 작업 PC 기본) | 2026-09-30 이 세션에서 `npm test` 재실행: 118/118 통과 (`typecheck`, `build`는 재실행하지 않음) |
 | 브라우저 (P0-3) | 예약금 흐름 7개 시나리오 전부 통과, 콘솔 오류 없음 (아래 P0-3 절) |
-| GitHub Actions CI | **success** — `CI` run #3 (`21da4f4`, push 이벤트), [run 36619141452](https://github.com/yun9207-design/02-reservation-noshow-dashboard/actions/runs/36619141452). run #1(`2c1f78b`), #2(`80fa33c`)도 success |
+| GitHub Actions CI | **success** — `CI` run #3 (`21da4f4`, push 이벤트), [run 36619141452](https://github.com/yun9207-design/02-reservation-noshow-dashboard/actions/runs/36619141452). run #1(`2c1f78b`), #2(`80fa33c`), #4(`8fffb97`, 문서 커밋)도 success (#4는 2026-09-30 GitHub 공개 API로 확인) |
 | Vercel production | Production 배포 `success` (GitHub에 기록된 배포 6743507665). production 주소가 HTTP 200으로 응답하고 내용의 SHA256(앞 16자 `66dd871ad64f6044`)이 `HEAD:preview.html`과 같음 (2026-09-30 확인) |
 
 테스트 수 변화:
@@ -113,7 +113,7 @@ P0-2 작업 중 다시 확인한 P0-1 동작(브라우저): 정책 값이 복구
 
 - `tests/browser_smoke.py`(Playwright), `npm run test:e2e` 실행 기록
 - Chrome/Edge에서 전체 UI 시나리오(`학습 가이드` 6개 시나리오)를 사람이 훑은 기록
-- CSV 반영, 대기자 제안 무결성 회귀 테스트(P0-4, P0-5에서 추가). 현재 코드에서 재현된 문제 목록은 `PROJECT_STATE.md`의 "알려진 위험"
+- CSV 반영, 대기자 제안 무결성 회귀 테스트(Backlog P0-4, P0-5를 착수할 때 추가). 현재 코드에서 재현된 문제 목록은 `PROJECT_STATE.md`의 "알려진 위험"
 - 옛 저장 데이터·백업에 들어 있는 예약/예약금 모순 조합(D7)을 읽고 복원하는 경로의 테스트. 처리 방식이 아직 결정되지 않았습니다
 
 ---

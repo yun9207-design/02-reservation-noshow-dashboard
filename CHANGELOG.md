@@ -17,6 +17,7 @@
 - **Documentation system** (`80fa33c`, refreshed for P0-3): `PROJECT_STATE.md` (current state, known risks, next task) and `BUSINESS_MODEL.md` (the reservation business this app teaches, state transitions, real vs. simulated features). `docs/TEST_REPORT.md` now carries the current verification record and keeps the initial 41-test baseline as history. `AGENTS.md` and `CLAUDE.md` gained session and workflow rules.
 
 ### Changed
+- **Project phase:** declared `02 Learning v1 Complete` (2026-09-30, user decision). The goal of this project is to learn the reservation / no-show / open-slot recovery business, not to ship a commercial service. P0-4 (CSV integrity), P0-5 (waitlist offer integrity) and D7 (pre-P0-3 contradictory data) moved to a commercial hardening backlog and are not started until the user asks. `PROJECT_STATE.md` no longer names a forced next task. Documentation only, no code change.
 - `LocalRepository.replace()` validates the whole state before writing and throws without touching storage when it is invalid. The old lenient loaders in `validation.ts` stay for reading the app's own localStorage.
 - Behaviour changes from P0-3 that users will notice: no-show is confirmed-only (a requested reservation used to be allowed), an arrived reservation cannot be cancelled, and an accepted waitlist offer that owes a deposit is `requested` + `unpaid` until a mock payment instead of an instantly confirmed, already-`paid` reservation.
 - Test count: 41 → 66 (P0-1) → 97 (P0-2) → 118 (P0-3).
@@ -29,8 +30,8 @@
 - Earlier, on `e0d75e1`/`2c1f78b`: Node 22.23.3 and Node 24.19.0 full verification (97/97); browser restore scenarios (10): valid backup, preview, blocked until `복원` is typed, restore, invalid status, duplicate ID, missing reference, policy-only repair, reload, failed restore keeps existing data.
 
 ### Known issues (found, not fixed yet)
-- **D7 (open):** reservation/deposit combinations saved before P0-3 (in localStorage or a backup) are not cleaned up and still pass load and restore validation, because P0-3 did not touch `backup.ts` or `validation.ts`. What to do with such data (repair on load, reject on restore, or warn) needs a decision.
-- CSV import integrity (C1–C4) and waitlist offer integrity (W1–W3) were reproduced against the engine and are listed in `PROJECT_STATE.md` (next: P0-4, then P0-5).
+- **D7 (open):** reservation/deposit combinations saved before P0-3 (in localStorage or a backup) are not cleaned up and still pass load and restore validation, because P0-3 did not touch `backup.ts` or `validation.ts`. What to do with such data (repair on load, reject on restore, or warn) needs a decision; it sits in the commercial hardening backlog.
+- CSV import integrity (C1–C4) and waitlist offer integrity (W1–W3) were reproduced against the engine and are listed in `PROJECT_STATE.md` (commercial hardening backlog: P0-4, P0-5).
 - P1 candidates recorded in `PROJECT_STATE.md`: keep the policy/terms version in force when a reservation was created (P1-1), and split "recovered reservation value" from actual recovered revenue (P1-2).
 
 ## v1.0.0 · 2026-09-29
