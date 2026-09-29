@@ -1,4 +1,5 @@
 import { AppState, BookingCheck, CancellationDecision, Reservation, ReservationDraft, Service, SlotRef, WaitlistEntry } from './types';
+import { repairPolicy } from './policy';
 export function money(n:number){return new Intl.NumberFormat('ko-KR').format(n)+'원';}
 export function dt(iso:string){const d=new Date(iso);return Number.isNaN(d.getTime())?'잘못된 날짜':new Intl.DateTimeFormat('ko-KR',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}).format(d);}
 export function dayKey(iso:string){const d=new Date(iso);const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return `${y}-${m}-${day}`;}
@@ -36,7 +37,9 @@ export function offerExpired(w:WaitlistEntry,now:string){return !!w.offer&&w.off
 export function activeReservationsOn(state:AppState,date:string){return state.reservations.filter(r=>dayKey(r.startAt)===date&&!['cancelled'].includes(r.status)).sort((a,b)=>a.startAt.localeCompare(b.startAt));}
 export function candidateSlots(state:AppState,date:string,staffId:string,serviceId:string){
   const service=state.services.find(s=>s.id===serviceId);if(!service)return [] as string[];const result:string[]=[];const [y,m,d]=date.split('-').map(Number);
-  for(let min=state.policy.openingHour*60;min+(service.durationMin+service.bufferMin)<=state.policy.closingHour*60;min+=state.policy.slotMinutes){const start=new Date(y,m-1,d,Math.floor(min/60),min%60);const iso=start.toISOString();if(bookingCheck(state,{customerId:'candidate',serviceId,staffId,startAt:iso}).ok)result.push(iso);}return result;
+  // Defensive: a bad slot step (0, negative, NaN) or hours must never make this loop run forever. Invalid values fall back to the defaults.
+  const pol=repairPolicy(state.policy).policy;
+  for(let min=pol.openingHour*60,guard=0;min+(service.durationMin+service.bufferMin)<=pol.closingHour*60&&guard<1500;min+=pol.slotMinutes,guard++){const start=new Date(y,m-1,d,Math.floor(min/60),min%60);const iso=start.toISOString();if(bookingCheck(state,{customerId:'candidate',serviceId,staffId,startAt:iso}).ok)result.push(iso);}return result;
 }
 export function serviceLabel(state:AppState,id:string){return state.services.find(s=>s.id===id)?.name??id;}
 export function customerLabel(state:AppState,id:string){return state.customers.find(c=>c.id===id)?.name??id;}

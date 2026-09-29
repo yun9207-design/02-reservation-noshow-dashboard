@@ -3909,6 +3909,7 @@ exports.changeClock = changeClock;
 exports.updatePolicy = updatePolicy;
 exports.addCustomer = addCustomer;
 const rules_1 = require("./rules");
+const policy_1 = require("./policy");
 function next(state) { const n = structuredClone(state); n.revision += 1; return n; }
 function id(prefix) { return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`; }
 function audit(state, type, entityId, message, at = state.simulatedNow) { state.audit.unshift({ id: id('AUD'), at, type, entityId, message }); state.audit = state.audit.slice(0, 5000); }
@@ -3970,8 +3971,8 @@ function expireOffers(state) { const n = structuredClone(state); let changed = f
     n.revision += 1; return n; }
 function changeClock(state, iso) { const n = next(state); if (Number.isNaN(new Date(iso).getTime()))
     throw Error('실습 시간을 확인하세요.'); n.simulatedNow = new Date(iso).toISOString(); audit(n, 'system', 'clock', '실습 시간을 변경했습니다.'); return expireOffers(n); }
-function updatePolicy(state, patch) { const n = next(state); n.policy = { ...n.policy, ...patch }; if (n.policy.openingHour >= n.policy.closingHour)
-    throw Error('영업 시작 시간은 종료 시간보다 빨라야 합니다.'); audit(n, 'policy', 'policy', '예약·취소 정책을 변경했습니다.'); return n; }
+function updatePolicy(state, patch) { const n = next(state); const merged = { ...n.policy, ...patch }; const problems = (0, policy_1.policyProblems)(merged); if (problems.length)
+    throw Error(problems.map(x => x.message).join(' ')); n.policy = merged; audit(n, 'policy', 'policy', '예약·취소 정책을 변경했습니다.'); return n; }
 function addCustomer(state, input) { const n = next(state); if (!input.name.trim())
     throw Error('고객 이름을 입력하세요.'); const cid = id('CUS'); n.customers.unshift({ id: cid, name: input.name.trim(), phone: input.phone.trim(), email: input.email.trim(), notes: input.notes?.trim() ?? '', visitCount: 0, noShowCount: 0 }); audit(n, 'system', cid, '고객을 등록했습니다.'); return n; }
 
@@ -3982,6 +3983,69 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.metrics = metrics;
 const rules_1 = require("./rules");
 function metrics(state) { const today = (0, rules_1.dayKey)(state.simulatedNow); const todays = state.reservations.filter(r => (0, rules_1.dayKey)(r.startAt) === today); const active = todays.filter(r => !['cancelled', 'no_show'].includes(r.status)); const confirmed = todays.filter(r => ['confirmed', 'arrived', 'completed'].includes(r.status)); const cancelled = todays.filter(r => r.status === 'cancelled'); const noShows = todays.filter(r => r.status === 'no_show'); const offered = state.waitlist.filter(w => w.status === 'offered').length; const waiting = state.waitlist.filter(w => w.status === 'waiting').length; const recovered = state.reservations.filter(r => r.source === 'waitlist' && r.status !== 'cancelled').reduce((sum, r) => sum + (state.services.find(s => s.id === r.serviceId)?.price ?? 0), 0); const capacity = Math.max(1, state.staff.filter(s => s.active).length * (state.policy.closingHour - state.policy.openingHour) * 60); const bookedMinutes = active.reduce((sum, r) => sum + Math.max(0, (new Date(r.endAt).getTime() - new Date(r.startAt).getTime()) / 60000), 0); return { todayCount: todays.length, activeToday: active.length, confirmedToday: confirmed.length, cancelledToday: cancelled.length, noShowsToday: noShows.length, offered, waiting, recovered, occupancy: Math.round(bookedMinutes / capacity * 100) }; }
+
+},
+"src/domain/policy":function(require,module,exports){
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.HOURS_ORDER_MESSAGE = exports.POLICY_DEFAULTS = exports.POLICY_LIMITS = void 0;
+exports.policyFieldOk = policyFieldOk;
+exports.policyProblems = policyProblems;
+exports.repairPolicy = repairPolicy;
+exports.POLICY_LIMITS = {
+    slotMinutes: { label: '기본 슬롯(분)', min: 5, max: 240, integer: true },
+    openingHour: { label: '영업 시작 시', min: 0, max: 23, integer: true },
+    closingHour: { label: '영업 종료 시', min: 1, max: 24, integer: true },
+    cancellationHours: { label: '취소 기준 시간', min: 0, max: 8760, integer: false },
+    noShowGraceMin: { label: '노쇼 유예(분)', min: 0, max: 1440, integer: false },
+    offerHoldMin: { label: '빈자리 제안 홀드(분)', min: 0, max: 10080, integer: false, minExclusive: true }
+};
+// Same numbers as the seed policy (src/data/seed.ts); a test keeps the two in sync.
+exports.POLICY_DEFAULTS = { slotMinutes: 30, openingHour: 9, closingHour: 19, cancellationHours: 24, noShowGraceMin: 10, offerHoldMin: 20 };
+const FIELDS = Object.keys(exports.POLICY_LIMITS);
+exports.HOURS_ORDER_MESSAGE = '영업 시작 시간은 종료 시간보다 빨라야 합니다.';
+function policyFieldOk(field, value) {
+    const l = exports.POLICY_LIMITS[field];
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return false;
+    if (l.integer && !Number.isInteger(value))
+        return false;
+    if (l.minExclusive ? value <= l.min : value < l.min)
+        return false;
+    return value <= l.max;
+}
+function rangeText(l) {
+    const kind = l.integer ? '정수' : '숫자';
+    return l.minExclusive ? `0보다 크고 ${l.max} 이하의 ${kind}를 입력하세요.` : `${l.min} 이상 ${l.max} 이하의 ${kind}를 입력하세요.`;
+}
+function policyProblems(policy) {
+    const p = (policy && typeof policy === 'object' ? policy : {});
+    const problems = [];
+    for (const f of FIELDS)
+        if (!policyFieldOk(f, p[f]))
+            problems.push({ field: f, message: `${exports.POLICY_LIMITS[f].label}: ${rangeText(exports.POLICY_LIMITS[f])}` });
+    if (policyFieldOk('openingHour', p.openingHour) && policyFieldOk('closingHour', p.closingHour) && p.openingHour >= p.closingHour)
+        problems.push({ field: 'hours', message: exports.HOURS_ORDER_MESSAGE });
+    return problems;
+}
+function show(v) { return typeof v === 'number' ? String(v) : v === undefined || v === null ? '없음' : JSON.stringify(v); }
+// Replaces only the invalid numeric values with the defaults; everything else in the policy is kept as it is.
+function repairPolicy(policy) {
+    const src = (policy && typeof policy === 'object' ? policy : {});
+    const fixed = { ...src };
+    const fixes = [];
+    for (const f of FIELDS)
+        if (!policyFieldOk(f, src[f])) {
+            fixed[f] = exports.POLICY_DEFAULTS[f];
+            fixes.push(`${exports.POLICY_LIMITS[f].label} ${show(src[f])} → ${exports.POLICY_DEFAULTS[f]}`);
+        }
+    if (fixed.openingHour >= fixed.closingHour) {
+        fixes.push(`영업시간 ${fixed.openingHour}~${fixed.closingHour} → ${exports.POLICY_DEFAULTS.openingHour}~${exports.POLICY_DEFAULTS.closingHour}`);
+        fixed.openingHour = exports.POLICY_DEFAULTS.openingHour;
+        fixed.closingHour = exports.POLICY_DEFAULTS.closingHour;
+    }
+    return { policy: fixed, fixes };
+}
 
 },
 "src/domain/rules":function(require,module,exports){
@@ -4008,6 +4072,7 @@ exports.serviceLabel = serviceLabel;
 exports.customerLabel = customerLabel;
 exports.staffLabel = staffLabel;
 exports.depositFor = depositFor;
+const policy_1 = require("./policy");
 function money(n) { return new Intl.NumberFormat('ko-KR').format(n) + '원'; }
 function dt(iso) { const d = new Date(iso); return Number.isNaN(d.getTime()) ? '잘못된 날짜' : new Intl.DateTimeFormat('ko-KR', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(d); }
 function dayKey(iso) { const d = new Date(iso); const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, '0'), day = String(d.getDate()).padStart(2, '0'); return `${y}-${m}-${day}`; }
@@ -4070,7 +4135,9 @@ function candidateSlots(state, date, staffId, serviceId) {
         return [];
     const result = [];
     const [y, m, d] = date.split('-').map(Number);
-    for (let min = state.policy.openingHour * 60; min + (service.durationMin + service.bufferMin) <= state.policy.closingHour * 60; min += state.policy.slotMinutes) {
+    // Defensive: a bad slot step (0, negative, NaN) or hours must never make this loop run forever. Invalid values fall back to the defaults.
+    const pol = (0, policy_1.repairPolicy)(state.policy).policy;
+    for (let min = pol.openingHour * 60, guard = 0; min + (service.durationMin + service.bufferMin) <= pol.closingHour * 60 && guard < 1500; min += pol.slotMinutes, guard++) {
         const start = new Date(y, m - 1, d, Math.floor(min / 60), min % 60);
         const iso = start.toISOString();
         if (bookingCheck(state, { customerId: 'candidate', serviceId, staffId, startAt: iso }).ok)
@@ -4092,25 +4159,57 @@ Object.defineProperty(exports, "__esModule", { value: true });
 "src/domain/validation":function(require,module,exports){
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.parseStateWithNotes = parseStateWithNotes;
 exports.parseState = parseState;
+exports.parseBackupWithNotes = parseBackupWithNotes;
 exports.parseBackup = parseBackup;
 exports.backupLimit = backupLimit;
+const policy_1 = require("./policy");
 const MAX_BACKUP_CHARS = 4_200_000;
 function arr(v, name) { if (!Array.isArray(v))
     throw Error(`${name} 목록 형식이 아닙니다.`); return v; }
-function parseState(value) { const v = value; if (!v || typeof v !== 'object')
-    throw Error('백업 데이터가 객체가 아닙니다.'); if (v.schemaVersion !== 1)
-    throw Error('지원하지 않는 백업 버전입니다.'); arr(v.services, '서비스'); arr(v.staff, '담당자'); arr(v.customers, '고객'); arr(v.reservations, '예약'); arr(v.waitlist, '대기'); arr(v.audit, '이력'); if (!v.policy || typeof v.policy !== 'object')
-    throw Error('정책이 없습니다.'); if (Number.isNaN(new Date(v.simulatedNow).getTime()))
-    throw Error('실습 시간이 올바르지 않습니다.'); if (v.reservations.length > 3000 || v.waitlist.length > 3000 || v.audit.length > 10000)
-    throw Error('학습용 앱의 자료 한도를 넘었습니다.'); return structuredClone(v); }
-function parseBackup(raw) { if (raw.length > MAX_BACKUP_CHARS)
+function parseStateWithNotes(value) {
+    const v = value;
+    if (!v || typeof v !== 'object')
+        throw Error('백업 데이터가 객체가 아닙니다.');
+    if (v.schemaVersion !== 1)
+        throw Error('지원하지 않는 백업 버전입니다.');
+    arr(v.services, '서비스');
+    arr(v.staff, '담당자');
+    arr(v.customers, '고객');
+    arr(v.reservations, '예약');
+    arr(v.waitlist, '대기');
+    arr(v.audit, '이력');
+    if (!v.policy || typeof v.policy !== 'object')
+        throw Error('정책이 없습니다.');
+    if (Number.isNaN(new Date(v.simulatedNow).getTime()))
+        throw Error('실습 시간이 올바르지 않습니다.');
+    if (v.reservations.length > 3000 || v.waitlist.length > 3000 || v.audit.length > 10000)
+        throw Error('학습용 앱의 자료 한도를 넘었습니다.');
+    const state = structuredClone(v);
+    const notes = [];
+    // Unusable policy numbers (0, negative, NaN, out of range) are replaced by defaults instead of being loaded as they are;
+    // slotMinutes <= 0 used to freeze the schedule screen. The rest of the data is kept and the repair is written to the audit log.
+    const repaired = (0, policy_1.repairPolicy)(state.policy);
+    if (repaired.fixes.length) {
+        state.policy = repaired.policy;
+        const message = `불러온 정책 값이 올바르지 않아 기본값으로 바꿨습니다: ${repaired.fixes.join(', ')}`;
+        state.audit.unshift({ id: `AUD-POLICY-${Date.now().toString(36)}`, at: state.simulatedNow, type: 'policy', entityId: 'policy', message });
+        if (state.audit.length > 10000)
+            state.audit.length = 10000;
+        notes.push(message);
+    }
+    return { state, notes };
+}
+function parseState(value) { return parseStateWithNotes(value).state; }
+function parseBackupWithNotes(raw) { if (raw.length > MAX_BACKUP_CHARS)
     throw Error('백업 파일이 너무 큽니다. 4MB 이하로 줄여 주세요.'); let parsed; try {
     parsed = JSON.parse(raw);
 }
 catch {
     throw Error('JSON 백업 파일을 읽지 못했습니다.');
-} return parseState(parsed); }
+} return parseStateWithNotes(parsed); }
+function parseBackup(raw) { return parseBackupWithNotes(raw).state; }
 function backupLimit() { return MAX_BACKUP_CHARS; }
 
 },
@@ -4227,7 +4326,8 @@ class LocalRepository {
         return this.load();
     } this.expected = raw; this.blocked = false; if (!raw)
         return { state: (0, seed_1.makeSeed)(), mode: 'persistent', notice: '', raw: null }; try {
-        return { state: (0, validation_1.parseState)(JSON.parse(raw)), mode: 'persistent', notice: '', raw };
+        const parsed = (0, validation_1.parseStateWithNotes)(JSON.parse(raw));
+        return { state: parsed.state, mode: 'persistent', notice: parsed.notes.length ? `${parsed.notes.join(' ')} (저장하기 전까지 저장된 원본은 그대로입니다.)` : '', raw };
     }
     catch (e) {
         this.blocked = true;
@@ -4654,8 +4754,10 @@ const store_1 = require("../store");
 const ui_1 = require("../components/ui");
 const engine_1 = require("../domain/engine");
 const rules_1 = require("../domain/rules");
-function Policies() { const { state, run } = (0, store_1.useData)(); const [p, setP] = (0, react_1.useState)(state.policy); function save() { run(s => (0, engine_1.updatePolicy)(s, p), '예약 정책을 저장했습니다.'); } return react_1.default.createElement(react_1.default.Fragment, null,
-    react_1.default.createElement(ui_1.PageHeading, { eyebrow: "POLICY & DEPOSIT", title: "\uC815\uCC45 \u00B7 \uC608\uC57D\uAE08", description: "\uC5B8\uC81C \uCDE8\uC18C\uD558\uBA74 \uD658\uBD88\uB418\uB294\uC9C0, \uB178\uC1FC \uC2DC \uC608\uC57D\uAE08\uC744 \uC5B4\uB5BB\uAC8C \uCC98\uB9AC\uD558\uB294\uC9C0 \uADDC\uCE59\uC73C\uB85C \uB9CC\uB4E4\uC5B4 \uBD05\uB2C8\uB2E4.", actions: react_1.default.createElement(ui_1.Button, { variant: "primary", onClick: save }, "\uC815\uCC45 \uC800\uC7A5") }),
+const policy_1 = require("../domain/policy");
+function Policies() { const { state, run } = (0, store_1.useData)(); const [p, setP] = (0, react_1.useState)(state.policy); const problems = (0, policy_1.policyProblems)(p); const bad = (f) => problems.some(x => x.field === f || (x.field === 'hours' && (f === 'openingHour' || f === 'closingHour'))) ? true : undefined; function save() { if (problems.length)
+    return; run(s => (0, engine_1.updatePolicy)(s, p), '예약 정책을 저장했습니다.'); } return react_1.default.createElement(react_1.default.Fragment, null,
+    react_1.default.createElement(ui_1.PageHeading, { eyebrow: "POLICY & DEPOSIT", title: "\uC815\uCC45 \u00B7 \uC608\uC57D\uAE08", description: "\uC5B8\uC81C \uCDE8\uC18C\uD558\uBA74 \uD658\uBD88\uB418\uB294\uC9C0, \uB178\uC1FC \uC2DC \uC608\uC57D\uAE08\uC744 \uC5B4\uB5BB\uAC8C \uCC98\uB9AC\uD558\uB294\uC9C0 \uADDC\uCE59\uC73C\uB85C \uB9CC\uB4E4\uC5B4 \uBD05\uB2C8\uB2E4.", actions: react_1.default.createElement(ui_1.Button, { variant: "primary", disabled: problems.length > 0, onClick: save }, "\uC815\uCC45 \uC800\uC7A5") }),
     react_1.default.createElement(ui_1.Help, { title: "\uC815\uCC45\uC740 \uACE0\uAC1D \uC751\uB300 \uBB38\uAD6C\uBCF4\uB2E4 \uBA3C\uC800\uC785\uB2C8\uB2E4" }, "\uCDE8\uC18C\u00B7\uB178\uC1FC \uCC98\uB9AC \uACB0\uACFC\uAC00 \uC0AC\uB78C\uB9C8\uB2E4 \uB2EC\uB77C\uC9C0\uC9C0 \uC54A\uC73C\uB824\uBA74 \uBA3C\uC800 \uAE30\uC900\uC774 \uD544\uC694\uD569\uB2C8\uB2E4. \uC2E4\uC81C \uC0AC\uC5C5\uC5D0\uC11C\uB294 \uC18C\uBE44\uC790 \uBCF4\uD638 \uADDC\uC815, \uACB0\uC81C\uC0AC\uC758 \uD658\uBD88 \uADDC\uCE59, \uC5C5\uC885\uBCC4 \uAD00\uD589\uC744 \uBCC4\uB3C4\uB85C \uD655\uC778\uD574\uC57C \uD569\uB2C8\uB2E4."),
     react_1.default.createElement("div", { className: "two-column" },
         react_1.default.createElement("section", { className: "panel" },
@@ -4664,17 +4766,18 @@ function Policies() { const { state, run } = (0, store_1.useData)(); const [p, s
                 react_1.default.createElement(ui_1.Field, { label: "\uC0AC\uC5C5\uC7A5 \uC774\uB984" },
                     react_1.default.createElement("input", { value: p.businessName, onChange: e => setP({ ...p, businessName: e.target.value }) })),
                 react_1.default.createElement(ui_1.Field, { label: "\uCDE8\uC18C \uAE30\uC900 \uC2DC\uAC04" },
-                    react_1.default.createElement("input", { type: "number", min: "0", value: p.cancellationHours, onChange: e => setP({ ...p, cancellationHours: Number(e.target.value) }) })),
+                    react_1.default.createElement("input", { type: "number", min: "0", max: policy_1.POLICY_LIMITS.cancellationHours.max, "aria-invalid": bad('cancellationHours'), value: p.cancellationHours, onChange: e => setP({ ...p, cancellationHours: Number(e.target.value) }) })),
                 react_1.default.createElement(ui_1.Field, { label: "\uB178\uC1FC \uC720\uC608(\uBD84)" },
-                    react_1.default.createElement("input", { type: "number", min: "0", value: p.noShowGraceMin, onChange: e => setP({ ...p, noShowGraceMin: Number(e.target.value) }) })),
+                    react_1.default.createElement("input", { type: "number", min: "0", max: policy_1.POLICY_LIMITS.noShowGraceMin.max, "aria-invalid": bad('noShowGraceMin'), value: p.noShowGraceMin, onChange: e => setP({ ...p, noShowGraceMin: Number(e.target.value) }) })),
                 react_1.default.createElement(ui_1.Field, { label: "\uBE48\uC790\uB9AC \uC81C\uC548 \uD640\uB4DC(\uBD84)" },
-                    react_1.default.createElement("input", { type: "number", min: "1", value: p.offerHoldMin, onChange: e => setP({ ...p, offerHoldMin: Number(e.target.value) }) })),
+                    react_1.default.createElement("input", { type: "number", min: "1", max: policy_1.POLICY_LIMITS.offerHoldMin.max, "aria-invalid": bad('offerHoldMin'), value: p.offerHoldMin, onChange: e => setP({ ...p, offerHoldMin: Number(e.target.value) }) })),
                 react_1.default.createElement(ui_1.Field, { label: "\uC601\uC5C5 \uC2DC\uC791 \uC2DC" },
-                    react_1.default.createElement("input", { type: "number", min: "0", max: "23", value: p.openingHour, onChange: e => setP({ ...p, openingHour: Number(e.target.value) }) })),
+                    react_1.default.createElement("input", { type: "number", min: "0", max: "23", "aria-invalid": bad('openingHour'), value: p.openingHour, onChange: e => setP({ ...p, openingHour: Number(e.target.value) }) })),
                 react_1.default.createElement(ui_1.Field, { label: "\uC601\uC5C5 \uC885\uB8CC \uC2DC" },
-                    react_1.default.createElement("input", { type: "number", min: "1", max: "24", value: p.closingHour, onChange: e => setP({ ...p, closingHour: Number(e.target.value) }) })),
+                    react_1.default.createElement("input", { type: "number", min: "1", max: "24", "aria-invalid": bad('closingHour'), value: p.closingHour, onChange: e => setP({ ...p, closingHour: Number(e.target.value) }) })),
                 react_1.default.createElement(ui_1.Field, { label: "\uAE30\uBCF8 \uC2AC\uB86F(\uBD84)" },
-                    react_1.default.createElement("input", { type: "number", min: "5", step: "5", value: p.slotMinutes, onChange: e => setP({ ...p, slotMinutes: Number(e.target.value) }) }))),
+                    react_1.default.createElement("input", { type: "number", min: "5", max: policy_1.POLICY_LIMITS.slotMinutes.max, step: "5", "aria-invalid": bad('slotMinutes'), value: p.slotMinutes, onChange: e => setP({ ...p, slotMinutes: Number(e.target.value) }) }))),
+            problems.length > 0 && react_1.default.createElement("ul", { className: "issue-list", role: "alert" }, problems.map(x => react_1.default.createElement("li", { key: x.field }, x.message))),
             react_1.default.createElement("div", { className: "action-row" },
                 react_1.default.createElement("label", null,
                     react_1.default.createElement("input", { type: "checkbox", checked: p.requireDeposit, onChange: e => setP({ ...p, requireDeposit: e.target.checked }) }),
@@ -5033,8 +5136,8 @@ const files_1 = require("../lib/files");
 const validation_1 = require("../domain/validation");
 function Settings() { const { state, run, replace, reset, raw } = (0, store_1.useData)(); const [clock, setClock] = (0, react_1.useState)((0, rules_1.localInput)(state.simulatedNow)); const [confirm, setConfirm] = (0, react_1.useState)(false); const input = (0, react_1.useRef)(null); const rawText = raw() ?? JSON.stringify(state); const usage = Math.min(100, Math.round(rawText.length / 5_200_000 * 100)); function backup() { (0, files_1.downloadText)(`reservation-lab-backup-${Date.now()}.json`, JSON.stringify(state, null, 2), 'application/json;charset=utf-8'); } async function restore(file) { try {
     const text = await file.text();
-    const next = (0, validation_1.parseBackup)(text);
-    replace(next, '백업을 복원했습니다.');
+    const parsed = (0, validation_1.parseBackupWithNotes)(text);
+    replace(parsed.state, parsed.notes.length ? '백업을 복원했습니다. 올바르지 않은 정책 값은 기본값으로 바꿨습니다(감사 이력에 기록).' : '백업을 복원했습니다.');
 }
 catch (e) {
     alert(e.message);

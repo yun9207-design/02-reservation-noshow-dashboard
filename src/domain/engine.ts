@@ -1,5 +1,6 @@
 import { AppState, ReservationDraft, WaitlistEntry } from './types';
 import { addMinutes, bookingCheck, canMarkNoShow, cancellationDecision, getReservation, getService, offerExpired, waitlistMatches } from './rules';
+import { policyProblems } from './policy';
 function next<T extends AppState>(state:T){const n=structuredClone(state);n.revision+=1;return n;}
 function id(prefix:string){return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,6)}`;}
 function audit(state:AppState,type:any,entityId:string,message:string,at=state.simulatedNow){state.audit.unshift({id:id('AUD'),at,type,entityId,message});state.audit=state.audit.slice(0,5000);}
@@ -19,5 +20,5 @@ export function acceptOffer(state:AppState,waitId:string){let n=expireOffers(sta
 export function declineOffer(state:AppState,waitId:string){const n=next(state);const w=n.waitlist.find(x=>x.id===waitId);if(!w||w.status!=='offered'||!w.offer)throw Error('거절할 제안이 없습니다.');w.offer.status='declined';w.status='waiting';audit(n,'offer',w.id,'빈자리 제안을 거절하고 대기 상태로 되돌렸습니다.');return n;}
 export function expireOffers(state:AppState){const n=structuredClone(state);let changed=false;for(const w of n.waitlist){if(w.status==='offered'&&offerExpired(w,n.simulatedNow)&&w.offer){w.offer.status='expired';w.status='waiting';audit(n,'offer',w.id,'제안 유효 시간이 지나 대기 상태로 되돌렸습니다.');changed=true;}}if(changed)n.revision+=1;return n;}
 export function changeClock(state:AppState,iso:string){const n=next(state);if(Number.isNaN(new Date(iso).getTime()))throw Error('실습 시간을 확인하세요.');n.simulatedNow=new Date(iso).toISOString();audit(n,'system','clock','실습 시간을 변경했습니다.');return expireOffers(n);}
-export function updatePolicy(state:AppState,patch:Partial<AppState['policy']>){const n=next(state);n.policy={...n.policy,...patch};if(n.policy.openingHour>=n.policy.closingHour)throw Error('영업 시작 시간은 종료 시간보다 빨라야 합니다.');audit(n,'policy','policy','예약·취소 정책을 변경했습니다.');return n;}
+export function updatePolicy(state:AppState,patch:Partial<AppState['policy']>){const n=next(state);const merged={...n.policy,...patch};const problems=policyProblems(merged);if(problems.length)throw Error(problems.map(x=>x.message).join(' '));n.policy=merged;audit(n,'policy','policy','예약·취소 정책을 변경했습니다.');return n;}
 export function addCustomer(state:AppState,input:{name:string;phone:string;email:string;notes?:string}){const n=next(state);if(!input.name.trim())throw Error('고객 이름을 입력하세요.');const cid=id('CUS');n.customers.unshift({id:cid,name:input.name.trim(),phone:input.phone.trim(),email:input.email.trim(),notes:input.notes?.trim()??'',visitCount:0,noShowCount:0});audit(n,'system',cid,'고객을 등록했습니다.');return n;}
