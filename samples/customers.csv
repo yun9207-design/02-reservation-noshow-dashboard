@@ -1,0 +1,3 @@
+id,name,phone,email,notes,visitCount,noShowCount
+CUS-901,샘플고객A,010-0000-9901,sample901@example.test,오후 선호,1,0
+CUS-902,샘플고객B,010-0000-9902,sample902@example.test,담당자 무관,0,0

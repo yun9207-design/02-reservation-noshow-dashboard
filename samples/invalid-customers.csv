@@ -1,0 +1,3 @@
+id,name,phone,email
+CUS-001,중복고객,010-9999-0001,dup@example.test
+,이름만있음,010-9999-0002,missing@example.test

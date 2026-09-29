@@ -1,0 +1,4 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/domain", "src/data", "src/lib/csv.ts", "src/lib/repository.ts", "src/lib/files.ts"]
+}

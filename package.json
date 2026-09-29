@@ -1,0 +1,23 @@
+{
+  "name": "reservation-noshow-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "예약·노쇼·취소 빈자리 회복 흐름을 배우는 로컬 우선 실습 대시보드",
+  "engines": {"node": ">=22.12.0"},
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "node scripts/build.mjs",
+    "build:vite": "vite build",
+    "preview": "node scripts/serve.mjs",
+    "typecheck": "tsc --noEmit",
+    "typecheck:domain": "tsc -p tsconfig.domain.json --noEmit",
+    "test": "node scripts/test.mjs",
+    "verify": "npm run typecheck && npm run typecheck:domain && npm test && npm run build && npm run build:vite",
+    "test:e2e": "python tests/browser_smoke.py",
+    "format": "node scripts/format.mjs"
+  },
+  "dependencies": {"react": "19.1.1", "react-dom": "19.1.1"},
+  "devDependencies": {"@types/react": "^19.1.0", "@types/react-dom": "^19.1.0", "typescript": "5.8.3", "vite": "^7.3.1"},
+  "license": "MIT"
+}

@@ -1,0 +1,5 @@
+import fs from 'node:fs';import path from 'node:path';import {spawnSync} from 'node:child_process';import ts from 'typescript';
+function walk(p){return fs.readdirSync(p,{withFileTypes:true}).flatMap(e=>e.isDirectory()?walk(path.join(p,e.name)):[path.join(p,e.name)]);}
+fs.rmSync('.test-build',{recursive:true,force:true});fs.mkdirSync('.test-build',{recursive:true});fs.writeFileSync('.test-build/package.json','{"type":"commonjs"}');
+for(const file of walk('src').filter(f=>f.endsWith('.ts')&&!f.endsWith('.d.ts'))){const out=path.join('.test-build',file.replace(/\.ts$/,'.js'));fs.mkdirSync(path.dirname(out),{recursive:true});fs.writeFileSync(out,ts.transpileModule(fs.readFileSync(file,'utf8'),{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS,esModuleInterop:true}}).outputText);}
+const files=fs.readdirSync('tests').filter(f=>f.endsWith('.test.cjs')).map(f=>path.join('tests',f));const result=spawnSync(process.execPath,['--test',...files],{stdio:'inherit'});process.exit(result.status??1);
